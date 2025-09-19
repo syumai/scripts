@@ -1,0 +1,132 @@
+#!/bin/bash
+
+# Automatically mark PR as ready for review when all checks pass
+
+show_usage() {
+    echo "Usage: $(basename "$0") <PR_NUMBER> [REPO] [OPTIONS]"
+    echo ""
+    echo "Arguments:"
+    echo "  PR_NUMBER    The pull request number to monitor"
+    echo "  REPO         Repository in format 'owner/repo' (optional, auto-detected if in git repo)"
+    echo ""
+    echo "Options:"
+    echo "  --interval N    Check interval in seconds (default: 60)"
+    echo "  --help, -h      Show this help message"
+    echo ""
+    echo "Examples:"
+    echo "  $(basename "$0") 4696                                    # Auto-detect repo"
+    echo "  $(basename "$0") 4696 owner/repo                        # Explicit repo"
+    echo "  $(basename "$0") 4696 --interval 30                     # Custom interval"
+    exit 1
+}
+
+# Parse arguments
+PR_NUMBER=""
+REPO=""
+INTERVAL=60
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --help|-h)
+            show_usage
+            ;;
+        --interval)
+            INTERVAL="$2"
+            shift 2
+            ;;
+        *)
+            if [ -z "$PR_NUMBER" ]; then
+                PR_NUMBER="$1"
+            elif [ -z "$REPO" ]; then
+                REPO="$1"
+            else
+                echo "Error: Too many arguments"
+                show_usage
+            fi
+            shift
+            ;;
+    esac
+done
+
+# Validate PR number
+if [ -z "$PR_NUMBER" ]; then
+    echo "Error: PR number is required"
+    show_usage
+fi
+
+if ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+    echo "Error: PR number must be a positive integer"
+    exit 1
+fi
+
+# Auto-detect repository if not provided
+if [ -z "$REPO" ]; then
+    echo "No repository specified, attempting to auto-detect..."
+    REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null)
+    if [ $? -ne 0 ] || [ -z "$REPO" ]; then
+        echo "Error: Could not auto-detect repository. Please specify repository or run from a git directory."
+        show_usage
+    fi
+    echo "Auto-detected repository: $REPO"
+fi
+
+# Validate PR exists
+echo "Validating PR #${PR_NUMBER} in repository ${REPO}..."
+pr_info=$(gh pr view $PR_NUMBER --repo $REPO --json title,state 2>&1)
+if [ $? -ne 0 ]; then
+    echo "Error: Could not find PR #${PR_NUMBER} in repository ${REPO}"
+    echo "Output: $pr_info"
+    exit 1
+fi
+
+pr_state=$(echo "$pr_info" | jq -r '.state' 2>/dev/null)
+if [ "$pr_state" != "OPEN" ]; then
+    echo "Error: PR #${PR_NUMBER} is not open (current state: ${pr_state})"
+    exit 1
+fi
+
+echo "✅ Found PR #${PR_NUMBER}: $(echo "$pr_info" | jq -r '.title')"
+echo "Starting monitoring of PR #${PR_NUMBER} in ${REPO}..."
+echo "Checking every ${INTERVAL} seconds for GitHub Actions status..."
+
+while true; do
+    echo "$(date): Checking PR status..."
+
+    # Get PR checks status
+    checks_output=$(gh pr checks $PR_NUMBER --repo $REPO --json state,name 2>&1)
+
+    if [ $? -ne 0 ]; then
+        echo "Error: Failed to get PR checks. Output: $checks_output"
+        exit 1
+    fi
+
+    # Check if all checks are completed and successful
+    pending_checks=$(echo "$checks_output" | jq -r '.[] | select(.state == "IN_PROGRESS" or .state == "QUEUED" or .state == "PENDING") | .name' 2>/dev/null)
+    failed_checks=$(echo "$checks_output" | jq -r '.[] | select(.state == "FAILURE" or .state == "CANCELLED" or .state == "TIMED_OUT") | .name' 2>/dev/null)
+
+    if [ -n "$failed_checks" ]; then
+        echo "❌ Failed checks detected:"
+        echo "$failed_checks"
+        echo "Waiting for checks to be fixed..."
+    elif [ -n "$pending_checks" ]; then
+        echo "⏳ Checks still running:"
+        echo "$pending_checks"
+    else
+        # All checks passed - mark as ready for review
+        echo "✅ All GitHub Actions have passed!"
+        echo "Marking PR #${PR_NUMBER} as ready for review..."
+
+        gh pr ready $PR_NUMBER --repo $REPO
+
+        if [ $? -eq 0 ]; then
+            echo "🎉 PR #${PR_NUMBER} has been marked as ready for review!"
+            exit 0
+        else
+            echo "❌ Failed to mark PR as ready for review. Please check manually."
+            exit 1
+        fi
+    fi
+
+    echo "Waiting ${INTERVAL} seconds before next check..."
+    sleep $INTERVAL
+done
